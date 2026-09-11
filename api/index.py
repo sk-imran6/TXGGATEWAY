@@ -5,11 +5,14 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from email.utils import parsedate_to_datetime
 from flask import Flask, request, Response
 
 app = Flask(__name__)
 
 DB_FILE = "/tmp/payments.db"
+KOLKATA = ZoneInfo("Asia/Kolkata")
 
 
 def json_response(data, status=200):
@@ -172,6 +175,39 @@ def get_email_body(msg):
     return body
 
 
+# ---------------- KOLKATA DATE CHECK ----------------
+
+def is_today_in_kolkata(date_header):
+    """
+    Check whether email date is today's date
+    according to Asia/Kolkata timezone.
+    """
+
+    if not date_header:
+        return False
+
+    try:
+        email_dt = parsedate_to_datetime(date_header)
+
+        if email_dt.tzinfo is None:
+            email_dt = email_dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        email_kolkata = email_dt.astimezone(
+            KOLKATA
+        )
+
+        today_kolkata = datetime.now(
+            KOLKATA
+        ).date()
+
+        return email_kolkata.date() == today_kolkata
+
+    except Exception:
+        return False
+
+
 # ---------------- PAYMENT PARSER ----------------
 
 def extract_payment_data(text):
@@ -196,7 +232,10 @@ def extract_payment_data(text):
         )
 
         if match:
-            amount = match.group(1).replace(",", "")
+            amount = match.group(1).replace(
+                ",",
+                ""
+            )
             break
 
     # Transaction ID
@@ -305,11 +344,26 @@ def verify_payment():
 
         mail.select("INBOX")
 
-        # Search requested ID
+        # --------------------------------
+        # SEARCH CURRENT DAY ONLY
+        # Gmail IMAP date is based on
+        # mailbox/server date, so we still
+        # perform an exact Kolkata date
+        # check below.
+        # --------------------------------
+
+        today_kolkata = datetime.now(
+            KOLKATA
+        )
+
+        today_str = today_kolkata.strftime(
+            "%d-%b-%Y"
+        )
+
         status, data = mail.search(
             None,
-            'TEXT',
-            f'"{requested_id}"'
+            'ON',
+            today_str
         )
 
         if status != "OK" or not data or not data[0]:
@@ -317,13 +371,13 @@ def verify_payment():
             return json_response({
                 "status": "not_found",
                 "first_time": False,
-                "message": "Payment not found."
+                "message": "Today's matching payment not found."
             })
 
         message_ids = data[0].split()
 
         # Latest emails first
-        message_ids = message_ids[-10:]
+        message_ids = message_ids[-20:]
         message_ids.reverse()
 
         for message_id in message_ids:
@@ -367,12 +421,31 @@ def verify_payment():
 
             lower_text = full_text.lower()
 
-            # Only received payment
+            # --------------------------------
+            # IMPORTANT:
+            # EXACT KOLKATA DATE CHECK
+            # --------------------------------
+
+            timestamp = msg.get(
+                "Date",
+                ""
+            )
+
+            if not is_today_in_kolkata(
+                timestamp
+            ):
+                continue
+
+            # --------------------------------
+            # ONLY RECEIVED PAYMENT
+            # --------------------------------
+
             if (
                 "you have successfully received"
                 not in lower_text
                 and
-                "successfully received" not in lower_text
+                "successfully received"
+                not in lower_text
             ):
                 continue
 
@@ -402,7 +475,10 @@ def verify_payment():
                 utr
             )
 
-            # Requested ID must match
+            # --------------------------------
+            # REQUESTED ID MUST MATCH
+            # --------------------------------
+
             if (
                 requested_normalized != txn_normalized
                 and
@@ -410,13 +486,10 @@ def verify_payment():
             ):
                 continue
 
-            # Timestamp
-            timestamp = msg.get(
-                "Date",
-                ""
-            )
+            # --------------------------------
+            # DUPLICATE PAYMENT CHECK
+            # --------------------------------
 
-            # Check duplicate payment
             if payment_used(
                 txn_id,
                 utr
@@ -436,14 +509,16 @@ def verify_payment():
                     "timestamp": timestamp
                 })
 
-            # First-time payment
+            # --------------------------------
+            # SAVE FIRST-TIME PAYMENT
+            # --------------------------------
+
             saved = save_payment(
                 txn_id,
                 utr,
                 amount
             )
 
-            # Race/duplicate protection
             if not saved:
 
                 return json_response({
@@ -460,6 +535,10 @@ def verify_payment():
                     "timestamp": timestamp
                 })
 
+            # --------------------------------
+            # VERIFIED
+            # --------------------------------
+
             return json_response({
                 "status": "verified",
                 "first_time": True,
@@ -472,13 +551,17 @@ def verify_payment():
                 "txn_id": txn_id,
                 "utr": utr,
                 "reference_id": utr or txn_id,
-                "timestamp": timestamp
+                "timestamp": timestamp,
+                "verification_date": today_kolkata.strftime(
+                    "%Y-%m-%d"
+                ),
+                "timezone": "Asia/Kolkata"
             })
 
         return json_response({
             "status": "not_found",
             "first_time": False,
-            "message": "Matching payment not found."
+            "message": "Matching payment not found in today's Kolkata date."
         })
 
     except imaplib.IMAP4.error:
@@ -489,7 +572,7 @@ def verify_payment():
             "message": "Gmail login failed."
         }, 401)
 
-    except Exception as e:
+    except Exception:
 
         return json_response({
             "status": "error",
@@ -513,7 +596,9 @@ def home():
 
     return json_response({
         "status": "online",
-        "service": "Payment Verification API"
+        "service": "Payment Verification API",
+        "timezone": "Asia/Kolkata",
+        "rule": "Only today's Kolkata-date emails are verified."
     })
 
 
